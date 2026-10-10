@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sistem Verifikasi Barcode Gudang PBF — Accurate & iPos</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
         * { box-sizing: border-box; }
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f0f2f5; margin: 0; padding: 20px; color: #333; }
@@ -104,7 +105,7 @@
         </div>
     </div>
 
-    <div id="statusBox" class="bg-ready">Silakan unggah file Excel Faktur (Accurate / iPos)</div>
+    <div id="statusBox" class="bg-ready">Silakan unggah Excel atau ZIP berisi faktur (Accurate / iPos)</div>
 
     <div id="summaryBar" class="summary-bar hidden">
         <div class="chip"><span class="chip-label">Faktur Lengkap</span><span class="chip-value" id="chipFaktur">0/0</span></div>
@@ -121,12 +122,12 @@
     </div>
 
     <div class="section">
-        <label>1. Unggah File Excel Faktur (.xls / .xlsx — bisa pilih beberapa file sekaligus)</label>
+        <label>1. Unggah File Excel Faktur (.xls / .xlsx / .zip — bisa pilih beberapa file sekaligus)</label>
         <div class="upload-row">
-            <input type="file" id="excelFile" accept=".xls, .xlsx" multiple onchange="handleExcelUpload(event)" onclick="this.value=''">
+            <input type="file" id="excelFile" accept=".xls,.xlsx,.zip" multiple onchange="handleExcelUpload(event)" onclick="this.value=''">
             <button id="resetBtn" class="btn-reset hidden" onclick="resetInvoice()">Reset Semua Faktur</button>
         </div>
-        <small class="hint">Tahan Ctrl saat memilih file untuk mengunggah banyak faktur sekaligus (mis. 5–10 faktur satu mitra digabung dalam satu sesi scan). Format Accurate / iPos dikenali otomatis. Halaman butuh internet saat pertama kali dibuka untuk memuat pustaka Excel.</small>
+        <small class="hint">Tahan Ctrl saat memilih file untuk mengunggah banyak faktur sekaligus (mis. 5–10 faktur satu mitra digabung dalam satu sesi scan). Format Accurate / iPos dikenali otomatis. ZIP boleh berisi Excel dalam subfolder; file lain dilewati. ZIP bersandi dan ZIP di dalam ZIP tidak dibaca. Maksimum 100 Excel, 25 MB per file, dan 100 MB total hasil ekstraksi per unggahan. Internet diperlukan untuk memuat pustaka Excel dan ZIP.</small>
     </div>
 
     <div class="section">
@@ -343,111 +344,131 @@
     // ===== PARSER END =====
 
     // ===================== UPLOAD EXCEL (MULTI-FAKTUR) =====================
-    function handleExcelUpload(e) {
-        const files = Array.from(e.target.files || []);
-        if (!files.length) return;
+    let importBusy = false;
+    const IMPORT_LIMITS = { file: 25 * 1024 * 1024, total: 100 * 1024 * 1024, count: 100 };
 
-        if (typeof XLSX === 'undefined') {
-            setStatus('PUSTAKA EXCEL BELUM TERMUAT — sambungkan internet lalu refresh halaman (F5).', 'error');
-            return;
-        }
-
-        let pending = files.length;
-        const addedFaktur = [];
-        const failedFiles = [];
-        const skippedFiles = [];
-        let addedItems = 0, addedQty = 0;
-
-        setStatus('MEMPROSES ' + files.length + ' FILE...', 'ready');
-
-        files.forEach((file) => {
-            const key = file.name + ':' + file.size;
-            if (loadedKeys.has(key)) {
-                skippedFiles.push(file.name);
-                finishOne();
-                return;
-            }
-
+    function readUploadFile(file) {
+        return new Promise((resolve, reject) => {
             const reader = new FileReader();
-            reader.onload = function(event) {
-                try {
-                    const data = new Uint8Array(event.target.result);
-                    const workbook = XLSX.read(data, { type: 'array' });
-
-                    // Satu file bisa berisi beberapa sheet faktur — parse semua sheet, ambil yang berisi item
-                    const sheetResults = [];
-                    workbook.SheetNames.forEach((sn) => {
-                        const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sn], { header: 1 });
-                        const r = parseInvoiceRows(rows);
-                        if (r.items.length > 0) sheetResults.push({ sheetName: sn, mode: r.mode, items: r.items });
-                    });
-
-                    if (sheetResults.length === 0) {
-                        failedFiles.push(file.name);
-                    } else {
-                        loadedKeys.add(key);
-                        const multiSheet = sheetResults.length > 1;
-                        sheetResults.forEach((sr) => {
-                            fakturSeq++;
-                            const fid = 'F' + fakturSeq;
-                            const label = file.name + (multiSheet ? ' · ' + sr.sheetName : '');
-                            const short = file.name.replace(/\.(xlsx|xls)$/i, '') + (multiSheet ? ' · ' + sr.sheetName : '');
-                            sr.items.forEach((it) => {
-                                it.fid = fid;
-                                it.fakturLabel = label;
-                                it.fakturShort = short;
-                                invoiceItems.push(it);
-                            });
-                            addedQty += sr.items.reduce((s, it) => s + it.target, 0);
-                            addedFaktur.push({ id: fid, key, label, short, mode: sr.mode });
-                        });
-                        addedItems += sheetResults.reduce((s, sr) => s + sr.items.length, 0);
-                    }
-                } catch (err) {
-                    console.error(err);
-                    failedFiles.push(file.name);
-                }
-                finishOne();
-            };
-            reader.onerror = function() {
-                failedFiles.push(file.name);
-                finishOne();
-            };
+            reader.onload = () => resolve(new Uint8Array(reader.result));
+            reader.onerror = () => reject(new Error('File tidak dapat dibaca'));
             reader.readAsArrayBuffer(file);
         });
+    }
 
-        function finishOne() {
-            pending--;
-            if (pending > 0) return;
-
-            els.excelFile.value = '';
-
-            if (addedFaktur.length > 0) {
-                els.resetBtn.classList.remove('hidden');
-                fakturList = fakturList.concat(addedFaktur);
-                refreshModeChip();
-                updateTable();
-                updateSummary();
-                renderFakturList();
-                let msg = addedFaktur.length + ' FAKTUR DIMUAT (' + addedItems + ' item, ' + addedQty + ' pcs)';
-                if (failedFiles.length) msg += ' — ' + failedFiles.length + ' FILE GAGAL';
-                if (skippedFiles.length) msg += ' — ' + skippedFiles.length + ' FILE GANDA DILEWATI';
-                setStatus(msg + '. SILAHKAN SCAN!', 'success');
-                els.scanInput.focus();
-                if (failedFiles.length) alert('File gagal dikenali:\n- ' + failedFiles.join('\n- ') + '\n\nPastikan file adalah ekspor faktur dari Accurate atau iPos.');
-                if (skippedFiles.length) alert('File sudah pernah dimuat sehingga dilewati:\n- ' + skippedFiles.join('\n- '));
-            } else {
-                updateTable();
-                updateSummary();
-                renderFakturList();
-                if (skippedFiles.length && !failedFiles.length) {
-                    setStatus('SEMUA FILE SUDAH PERNAH DIMUAT (DILEWATI). Unggah file lain, hapus faktur di daftar bila ingin memuat ulang, atau tekan Reset Semua Faktur.', 'warn');
-                    alert('File sudah pernah dimuat sehingga dilewati:\n- ' + skippedFiles.join('\n- ') + '\n\nUntuk memuat ulang file yang sama: hapus fakturnya dari "Daftar Faktur Dimuat" (tombol Hapus), atau tekan "Reset Semua Faktur".');
-                } else {
-                    setStatus('TIDAK ADA FILE YANG BERHASIL DIMUAT. Pastikan file adalah ekspor faktur Accurate / iPos.', 'error');
-                    alert('Tidak ada file yang berhasil dikenali.\nPastikan file yang diunggah adalah file ekspor dari Accurate atau iPos.');
+    function extractZipEntry(entry, budget) {
+        return new Promise((resolve, reject) => {
+            let size = 0;
+            const chunks = [];
+            const stream = entry.internalStream('uint8array');
+            stream.on('data', chunk => {
+                size += chunk.length;
+                budget.bytes += chunk.length;
+                if (size > IMPORT_LIMITS.file || budget.bytes > IMPORT_LIMITS.total) {
+                    stream.pause();
+                    chunks.length = 0;
+                    reject(new Error('Batas ukuran hasil ekstraksi terlampaui'));
+                    return;
                 }
+                chunks.push(chunk);
+            });
+            stream.on('error', reject);
+            stream.on('end', () => {
+                const bytes = new Uint8Array(size);
+                let offset = 0;
+                chunks.forEach(chunk => { bytes.set(chunk, offset); offset += chunk.length; });
+                resolve(bytes);
+            });
+            stream.resume();
+        });
+    }
+
+    async function handleExcelUpload(e) {
+        const files = Array.from(e.target.files || []);
+        if (!files.length || importBusy) return;
+        if (typeof XLSX === 'undefined' || (files.some(f => /\.zip$/i.test(f.name)) && typeof JSZip === 'undefined')) {
+            setStatus('PUSTAKA EXCEL/ZIP BELUM TERMUAT — sambungkan internet lalu buka ulang halaman.', 'error');
+            return;
+        }
+        importBusy = true;
+        els.excelFile.disabled = true;
+        els.resetBtn.disabled = true;
+        els.scanInput.disabled = true;
+        const failures = [], skipped = [], added = [];
+        const budget = { bytes: 0, count: 0 };
+        let ignored = 0;
+
+        function importWorkbook(name, bytes) {
+            const key = name + ':' + bytes.length;
+            if (loadedKeys.has(key)) { skipped.push(name); return; }
+            const workbook = XLSX.read(bytes, { type: 'array' });
+            const results = workbook.SheetNames.map(sheetName => {
+                const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1 });
+                return { sheetName, ...parseInvoiceRows(rows) };
+            }).filter(r => r.items.length);
+            if (!results.length) throw new Error('Tidak ada sheet faktur yang dikenali');
+            const staged = results.map(r => {
+                const id = 'F' + (++fakturSeq);
+                const label = name + (results.length > 1 ? ' · ' + r.sheetName : '');
+                const short = name.replace(/\.(xlsx|xls)$/i, '') + (results.length > 1 ? ' · ' + r.sheetName : '');
+                return { faktur: { id, key, label, short, mode: r.mode }, items: r.items.map(it => ({ ...it, fid: id, fakturLabel: label, fakturShort: short })) };
+            });
+            staged.forEach(s => {
+                fakturList.push(s.faktur);
+                invoiceItems.push(...s.items);
+                added.push(s.faktur);
+            });
+            loadedKeys.add(key);
+        }
+
+        try {
+            for (const file of files) {
+                setStatus('MEMPROSES: ' + file.name, 'ready');
+                try {
+                    if (file.size > IMPORT_LIMITS.file) throw new Error('File melebihi 25 MB');
+                    const bytes = await readUploadFile(file);
+                    if (/\.zip$/i.test(file.name)) {
+                        const zip = await JSZip.loadAsync(bytes);
+                        const entries = Object.values(zip.files).filter(entry => !entry.dir && /\.(xls|xlsx)$/i.test(entry.name) && !entry.name.startsWith('__MACOSX/') && !entry.name.split('/').pop().startsWith('~$'));
+                        ignored += Object.values(zip.files).filter(entry => !entry.dir).length - entries.length;
+                        if (!entries.length) throw new Error('ZIP tidak berisi file .xls/.xlsx');
+                        for (const entry of entries) {
+                            if (++budget.count > IMPORT_LIMITS.count) throw new Error('Maksimum 100 Excel per unggahan');
+                            const name = file.name + ' / ' + entry.name;
+                            try {
+                                setStatus('MEMBACA: ' + name, 'ready');
+                                importWorkbook(name, await extractZipEntry(entry, budget));
+                            } catch (err) {
+                                failures.push(name + ': ' + err.message);
+                                if (budget.bytes > IMPORT_LIMITS.total) break;
+                            }
+                        }
+                    } else if (/\.(xls|xlsx)$/i.test(file.name)) {
+                        if (++budget.count > IMPORT_LIMITS.count) throw new Error('Maksimum 100 Excel per unggahan');
+                        budget.bytes += bytes.length;
+                        if (budget.bytes > IMPORT_LIMITS.total) throw new Error('Total data melebihi 100 MB');
+                        importWorkbook(file.name, bytes);
+                    } else { ignored++; }
+                } catch (err) {
+                    failures.push(file.name + ': ' + err.message + (/\.zip$/i.test(file.name) ? ' (pastikan ZIP valid dan tanpa sandi)' : ''));
+                }
+                if (budget.bytes > IMPORT_LIMITS.total || budget.count > IMPORT_LIMITS.count) break;
             }
+        } finally {
+            importBusy = false;
+            els.excelFile.disabled = false;
+            els.resetBtn.disabled = false;
+            els.scanInput.disabled = false;
+            els.excelFile.value = '';
+            els.resetBtn.classList.toggle('hidden', !fakturList.length);
+            refreshModeChip();
+            updateTable();
+            updateSummary();
+            renderFakturList();
+            const msg = added.length + ' FAKTUR DIMUAT — ' + failures.length + ' GAGAL, ' + skipped.length + ' DUPLIKAT, ' + ignored + ' FILE LAIN DILEWATI';
+            setStatus(msg + (added.length ? '. SILAHKAN SCAN!' : ''), failures.length ? 'warn' : (added.length ? 'success' : 'warn'));
+            if (failures.length || skipped.length) alert(['Hasil impor:', ...failures.map(f => 'Gagal: ' + f), ...skipped.map(f => 'Duplikat: ' + f)].join('\n'));
+            els.scanInput.focus();
         }
     }
 
@@ -460,6 +481,7 @@
     }
 
     function resetInvoice() {
+        if (importBusy) return;
         if (fakturList.length > 0 && !confirm('Hapus SEMUA faktur yang sedang aktif (' + fakturList.length + ' faktur)?')) return;
         invoiceItems = [];
         fakturList = [];
@@ -478,6 +500,7 @@
     }
 
     function removeFaktur(fid) {
+        if (importBusy) return;
         const f = fakturList.find(x => x.id === fid);
         if (!f) return;
         const its = invoiceItems.filter(it => it.fid === fid);
@@ -543,7 +566,14 @@
             return;
         }
 
-        invoiceItems.forEach((item, idx) => {
+        // Urutkan tampilan saja; indeks asli menjaga alias dan alokasi scan tetap benar.
+        const displayItems = invoiceItems.map((item, idx) => ({ item, idx }));
+        displayItems.sort((a, b) =>
+            Number(a.item.scanned >= a.item.target) - Number(b.item.scanned >= b.item.target)
+            || a.idx - b.idx
+        );
+
+        displayItems.forEach(({ item, idx }) => {
             const isComplete = item.scanned >= item.target;
             const isOver = item.scanned > item.target;
             const tr = document.createElement('tr');
@@ -617,6 +647,7 @@
 
     // ===================== SCAN BARCODE =====================
     function checkBarcode(event) {
+        if (importBusy) return;
         if (event.key !== 'Enter') return;
         event.preventDefault();
 
